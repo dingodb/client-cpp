@@ -5,7 +5,7 @@ use std::ops;
 
 use anyhow::Result;
 use cxx::{CxxString, CxxVector};
-use futures::executor::block_on;
+use tikv_client::TimestampExt;
 use tokio::{
     runtime::Runtime,
     time::{timeout, Duration},
@@ -34,6 +34,12 @@ mod ffi {
         Included,
         Excluded,
         Unbounded,
+    }
+
+    struct TxnOptions {
+        try_one_pc: bool,
+        async_commit: bool,
+        read_only: bool,
     }
 
     #[namespace = "tikv_client_glue"]
@@ -81,11 +87,16 @@ mod ffi {
             pd_endpoints: &CxxVector<CxxString>,
         ) -> Result<Box<TransactionClient>>;
 
-        fn transaction_client_begin(client: &TransactionClient) -> Result<Box<Transaction>>;
+        fn transaction_client_begin(
+            client: &TransactionClient,
+            options: TxnOptions,
+        ) -> Result<Box<Transaction>>;
 
         fn transaction_client_begin_pessimistic(
             client: &TransactionClient,
         ) -> Result<Box<Transaction>>;
+
+        fn transaction_timestamp(transaction: &Transaction) -> u64;
 
         fn transaction_get(transaction: &mut Transaction, key: &CxxString)
             -> Result<OptionalValue>;
@@ -132,11 +143,13 @@ mod ffi {
         fn transaction_delete(transaction: &mut Transaction, key: &CxxString) -> Result<()>;
 
         fn transaction_commit(transaction: &mut Transaction) -> Result<()>;
+
+        fn transaction_rollback(transaction: &mut Transaction) -> Result<()>;
     }
 }
 
-#[repr(transparent)]
 struct TransactionClient {
+    pub rt: tokio::runtime::Runtime,
     inner: tikv_client::TransactionClient,
 }
 
@@ -145,8 +158,8 @@ struct RawKVClient {
     inner: tikv_client::RawClient,
 }
 
-#[repr(transparent)]
 struct Transaction {
+    rt: tokio::runtime::Handle,
     inner: tikv_client::Transaction,
 }
 
@@ -168,7 +181,11 @@ fn raw_client_new(pd_endpoints: &CxxVector<CxxString>) -> Result<Box<RawKVClient
 }
 
 fn transaction_client_new(pd_endpoints: &CxxVector<CxxString>) -> Result<Box<TransactionClient>> {
-    env_logger::init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
+    let runtime = Runtime::new().unwrap();
 
     let pd_endpoints = pd_endpoints
         .iter()
@@ -176,19 +193,40 @@ fn transaction_client_new(pd_endpoints: &CxxVector<CxxString>) -> Result<Box<Tra
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(Box::new(TransactionClient {
-        inner: block_on(tikv_client::TransactionClient::new(pd_endpoints))?,
+        inner: runtime.block_on(tikv_client::TransactionClient::new(pd_endpoints))?,
+        rt: runtime,
     }))
 }
 
-fn transaction_client_begin(client: &TransactionClient) -> Result<Box<Transaction>> {
+// begin_with_options(&self, options: TransactionOptions)
+
+fn transaction_client_begin(
+    client: &TransactionClient,
+    options: TxnOptions,
+) -> Result<Box<Transaction>> {
+    let mut txn_options = tikv_client::transaction::TransactionOptions::new_optimistic();
+    if options.try_one_pc {
+        txn_options = txn_options.try_one_pc();
+    }
+    if options.async_commit {
+        txn_options = txn_options.use_async_commit();
+    }
+    if options.read_only {
+        txn_options = txn_options.read_only();
+    }
+
     Ok(Box::new(Transaction {
-        inner: block_on(client.inner.begin_optimistic())?,
+        rt: client.rt.handle().clone(),
+        inner: client
+            .rt
+            .block_on(client.inner.begin_with_options(txn_options))?,
     }))
 }
 
 fn transaction_client_begin_pessimistic(client: &TransactionClient) -> Result<Box<Transaction>> {
     Ok(Box::new(Transaction {
-        inner: block_on(client.inner.begin_pessimistic())?,
+        rt: client.rt.handle().clone(),
+        inner: client.rt.block_on(client.inner.begin_pessimistic())?,
     }))
 }
 
@@ -291,8 +329,15 @@ fn raw_batch_put(cli: &RawKVClient, pairs: &CxxVector<KvPair>, timeout_ms: u64) 
     })
 }
 
+fn transaction_timestamp(transaction: &Transaction) -> u64 {
+    transaction.inner.start_timestamp().version()
+}
+
 fn transaction_get(transaction: &mut Transaction, key: &CxxString) -> Result<OptionalValue> {
-    match block_on(transaction.inner.get(key.as_bytes().to_vec()))? {
+    match transaction
+        .rt
+        .block_on(transaction.inner.get(key.as_bytes().to_vec()))?
+    {
         Some(value) => Ok(OptionalValue {
             is_none: false,
             value,
@@ -308,7 +353,10 @@ fn transaction_get_for_update(
     transaction: &mut Transaction,
     key: &CxxString,
 ) -> Result<OptionalValue> {
-    match block_on(transaction.inner.get_for_update(key.as_bytes().to_vec()))? {
+    match transaction
+        .rt
+        .block_on(transaction.inner.get_for_update(key.as_bytes().to_vec()))?
+    {
         Some(value) => Ok(OptionalValue {
             is_none: false,
             value,
@@ -325,7 +373,9 @@ fn transaction_batch_get(
     keys: &CxxVector<CxxString>,
 ) -> Result<Vec<KvPair>> {
     let keys = keys.iter().map(|key| key.as_bytes().to_vec());
-    let kv_pairs = block_on(transaction.inner.batch_get(keys))?
+    let kv_pairs = transaction
+        .rt
+        .block_on(transaction.inner.batch_get(keys))?
         .map(|tikv_client::KvPair(key, value)| KvPair {
             key: key.into(),
             value,
@@ -358,7 +408,9 @@ fn transaction_scan(
     limit: u32,
 ) -> Result<Vec<KvPair>> {
     let range = to_bound_range(start, start_bound, end, end_bound);
-    let kv_pairs = block_on(transaction.inner.scan(range, limit))?
+    let kv_pairs = transaction
+        .rt
+        .block_on(transaction.inner.scan(range, limit))?
         .map(|tikv_client::KvPair(key, value)| KvPair {
             key: key.into(),
             value,
@@ -376,14 +428,16 @@ fn transaction_scan_keys(
     limit: u32,
 ) -> Result<Vec<Key>> {
     let range = to_bound_range(start, start_bound, end, end_bound);
-    let keys = block_on(transaction.inner.scan_keys(range, limit))?
+    let keys = transaction
+        .rt
+        .block_on(transaction.inner.scan_keys(range, limit))?
         .map(|key| Key { key: key.into() })
         .collect();
     Ok(keys)
 }
 
 fn transaction_put(transaction: &mut Transaction, key: &CxxString, val: &CxxString) -> Result<()> {
-    block_on(
+    transaction.rt.block_on(
         transaction
             .inner
             .put(key.as_bytes().to_vec(), val.as_bytes().to_vec()),
@@ -392,12 +446,19 @@ fn transaction_put(transaction: &mut Transaction, key: &CxxString, val: &CxxStri
 }
 
 fn transaction_delete(transaction: &mut Transaction, key: &CxxString) -> Result<()> {
-    block_on(transaction.inner.delete(key.as_bytes().to_vec()))?;
+    transaction
+        .rt
+        .block_on(transaction.inner.delete(key.as_bytes().to_vec()))?;
     Ok(())
 }
 
 fn transaction_commit(transaction: &mut Transaction) -> Result<()> {
-    block_on(transaction.inner.commit())?;
+    transaction.rt.block_on(transaction.inner.commit())?;
+    Ok(())
+}
+
+fn transaction_rollback(transaction: &mut Transaction) -> Result<()> {
+    transaction.rt.block_on(transaction.inner.rollback())?;
     Ok(())
 }
 
