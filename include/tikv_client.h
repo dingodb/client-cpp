@@ -1,60 +1,95 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 #ifndef _TIKV_CLIENT_H_
-#define _TIKV_CLIENT_H_ 
+#define _TIKV_CLIENT_H_
 
 #include "lib.rs.h"
+#include <cstdint>
 #include <iostream>
 #include <optional>
+#include <vector>
+
+extern "C" {
+typedef int (*CallbackWithContext)(int, void *);
+}
 
 namespace tikv_client {
 
 struct KvPair final {
-    std::string key;
-    std::string value;
+  std::string key;
+  std::string value;
 
-    KvPair(std::string &&key, std::string &&value);
-    ffi::KvPair to_ffi();
+  KvPair(std::string &&key, std::string &&value);
+  ffi::KvPair to_ffi();
 };
+
+// struct TxnOptions {
+//   bool try_one_pc{false};
+//   bool async_commit{false};
+//   bool read_only{false};
+// };
 
 class Transaction {
 public:
-    Transaction(::rust::cxxbridge1::Box<tikv_client_glue::Transaction> txn);
-    std::optional<std::string> get(const std::string &key);
-    std::optional<std::string> get_for_update(const std::string &key);
-    std::vector<KvPair> batch_get(const std::vector<std::string> &keys);
-    std::vector<KvPair> batch_get_for_update(const std::vector<std::string> &keys);
-    std::vector<KvPair> scan(const std::string &start, Bound start_bound, const std::string &end, Bound end_bound, std::uint32_t limit);
-    std::vector<std::string> scan_keys(const std::string &start, Bound start_bound, const std::string &end, Bound end_bound, std::uint32_t limit);
-    void put(const std::string &key, const std::string &value);
-    void batch_put(const std::vector<KvPair> &kvs);
-    void remove(const std::string &key);
-    void commit();
+  Transaction(::rust::cxxbridge1::Box<tikv_client_glue::Transaction> txn);
+
+  uint64_t id() const;
+
+  std::optional<std::string> get(const std::string &key);
+  std::optional<std::string> get_for_update(const std::string &key);
+
+  std::vector<KvPair> batch_get(const std::vector<std::string> &keys);
+  std::vector<KvPair>
+  batch_get_for_update(const std::vector<std::string> &keys);
+
+  std::vector<KvPair> scan(const std::string &start, Bound start_bound,
+                           const std::string &end, Bound end_bound,
+                           std::uint32_t limit);
+  std::vector<std::string> scan_keys(const std::string &start,
+                                     Bound start_bound, const std::string &end,
+                                     Bound end_bound, std::uint32_t limit);
+
+  void put(const std::string &key, const std::string &value);
+  void batch_put(const std::vector<KvPair> &kvs);
+
+  void remove(const std::string &key);
+
+  void commit();
+  void rollback();
+
 private:
-    ::rust::cxxbridge1::Box<tikv_client_glue::Transaction> _txn;
+  ::rust::cxxbridge1::Box<tikv_client_glue::Transaction> _txn;
 };
 
 class TransactionClient {
 public:
-    TransactionClient(const std::vector<std::string> &pd_endpoints);
-    Transaction begin();
-    Transaction begin_pessimistic();
+  TransactionClient(const std::vector<std::string> &pd_endpoints);
+  Transaction begin(TxnOptions options);
+
+  Transaction begin();
+  Transaction begin_pessimistic();
+
 private:
-    ::rust::cxxbridge1::Box<tikv_client_glue::TransactionClient> _client;
+  ::rust::cxxbridge1::Box<tikv_client_glue::TransactionClient> _client;
 };
 
 class RawKVClient {
 public:
-    RawKVClient(const std::vector<std::string> &pd_endpoints);
-    std::optional<std::string> get(const std::string &key,const std::uint64_t timeout);
-    void put(const std::string &key, const std::string &value, const std::uint64_t timeout);
-    void batch_put(const std::vector<KvPair> &kvs, const std::uint64_t timeout);
-    void remove(const std::string &key, const std::uint64_t timeout);
-    void remove_range(const std::string &start_key, const std::string &end_key, const std::uint64_t timeout);
-    std::vector<KvPair> scan(const std::string &startKey, const std::string &endKey, std::uint32_t limit, const std::uint64_t timeout);
+  RawKVClient(const std::vector<std::string> &pd_endpoints);
+  std::optional<std::string> get(const std::string &key,
+                                 const std::uint64_t timeout);
+  void put(const std::string &key, const std::string &value,
+           const std::uint64_t timeout);
+  void batch_put(const std::vector<KvPair> &kvs, const std::uint64_t timeout);
+  void remove(const std::string &key, const std::uint64_t timeout);
+  void remove_range(const std::string &start_key, const std::string &end_key,
+                    const std::uint64_t timeout);
+  std::vector<KvPair> scan(const std::string &startKey,
+                           const std::string &endKey, std::uint32_t limit,
+                           const std::uint64_t timeout);
 
 private:
-    ::rust::cxxbridge1::Box<tikv_client_glue::RawKVClient> _client;
+  ::rust::cxxbridge1::Box<tikv_client_glue::RawKVClient> _client;
 };
 
 } // namespace tikv_client
