@@ -25,9 +25,9 @@ include_directories(
     ${CMAKE_CURRENT_BINARY_DIR}/cxxbridge/client-cpp/src
     ${CMAKE_SOURCE_DIR}/include
 )
+
 add_library(tikvcpp STATIC src/tikv_client.cpp ${RUST_PART_CXX})
-get_filename_component(RUST_PART_ABS_H "${RUST_PART_H}" REALPATH)
-set_target_properties(tikvcpp PROPERTIES PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/tikv_client.h;${RUST_PART_ABS_H}")
+set_target_properties(tikvcpp PROPERTIES PUBLIC_HEADER "${CMAKE_SOURCE_DIR}/include/tikv_client.h")
 
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
@@ -41,6 +41,10 @@ install(TARGETS tikvcpp
         LIBRARY DESTINATION lib
         PUBLIC_HEADER DESTINATION include/tikv
         )
+        
+install(CODE "
+    file(INSTALL \"${RUST_PART_H}\" DESTINATION \"${CMAKE_INSTALL_PREFIX}/include/tikv\" FOLLOW_SYMLINK_CHAIN)
+")
 
 install(FILES ${RUST_PART_LIB} DESTINATION lib)
 
