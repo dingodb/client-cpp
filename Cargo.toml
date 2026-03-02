@@ -16,7 +16,7 @@ log = "0.4"
 libc = "0.2.177"
 env_logger = "0.8"
 tokio = { version = "1.28.2", features = ["full"] }
-tikv-client = { git = "https://github.com/tikv/client-rust.git", rev = "691df4d" }
+tikv-client = { git = "https://github.com/tikv/client-rust.git", rev = "b87adfa" }
 
 [build-dependencies]
 cxx-build = "1.0.190"
