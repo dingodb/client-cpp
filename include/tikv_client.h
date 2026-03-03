@@ -5,8 +5,11 @@
 
 #include "lib.rs.h"
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <iostream>
 #include <optional>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -23,11 +26,17 @@ struct KvPair final {
   ffi::KvPair to_ffi();
 };
 
-// struct TxnOptions {
-//   bool try_one_pc{false};
-//   bool async_commit{false};
-//   bool read_only{false};
-// };
+// Callback types for async operations
+typedef void (*TransactionGetCallback)(
+    const std::optional<std::string> *value,
+    const std::string *error,
+    void *context
+);
+
+typedef void (*TransactionVoidCallback)(
+    const std::string *error,  // null on success
+    void *context
+);
 
 class Transaction {
 public:
@@ -35,6 +44,7 @@ public:
 
   uint64_t id() const;
 
+  // Synchronous APIs
   std::optional<std::string> get(const std::string &key);
   std::optional<std::string> get_for_update(const std::string &key);
 
@@ -56,6 +66,43 @@ public:
 
   void commit();
   void rollback();
+
+  // Asynchronous APIs
+  void get_async(
+      const std::string &key,
+      TransactionGetCallback callback,
+      void *context
+  );
+
+  void put_async(
+      const std::string &key,
+      const std::string &value,
+      TransactionVoidCallback callback,
+      void *context
+  );
+
+  void remove_async(
+      const std::string &key,
+      TransactionVoidCallback callback,
+      void *context
+  );
+
+  void commit_async(
+      TransactionVoidCallback callback,
+      void *context
+  );
+
+  void rollback_async(
+      TransactionVoidCallback callback,
+      void *context
+  );
+
+  // Future-based convenience wrappers
+  std::future<std::optional<std::string>> get_async_future(const std::string &key);
+  std::future<void> put_async_future(const std::string &key, const std::string &value);
+  std::future<void> remove_async_future(const std::string &key);
+  std::future<void> commit_async_future();
+  std::future<void> rollback_async_future();
 
 private:
   ::rust::cxxbridge1::Box<tikv_client_glue::Transaction> _txn;

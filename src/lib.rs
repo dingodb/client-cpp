@@ -2,10 +2,12 @@
 
 use core::panic;
 use std::ops;
+use std::sync::Arc;
 
 use anyhow::Result;
 use cxx::{CxxString, CxxVector};
 use tikv_client::TimestampExt;
+use tokio::sync::Mutex;
 use tokio::{
     runtime::Runtime,
     time::{timeout, Duration},
@@ -145,6 +147,41 @@ mod ffi {
         fn transaction_commit(transaction: &mut Transaction) -> Result<()>;
 
         fn transaction_rollback(transaction: &mut Transaction) -> Result<()>;
+
+        // Async variants - using function pointer and context
+        fn transaction_get_async(
+            transaction: &Transaction,
+            key: &CxxString,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_put_async(
+            transaction: &Transaction,
+            key: &CxxString,
+            val: &CxxString,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_delete_async(
+            transaction: &Transaction,
+            key: &CxxString,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_commit_async(
+            transaction: &Transaction,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_rollback_async(
+            transaction: &Transaction,
+            callback: usize,
+            ctx: usize,
+        );
     }
 }
 
@@ -158,10 +195,15 @@ struct RawKVClient {
     inner: tikv_client::RawClient,
 }
 
+// Re-architected Transaction to support async operations
+// Wrap inner transaction in Arc<Mutex<_>> for thread-safe sharing across async tasks
 struct Transaction {
     rt: tokio::runtime::Handle,
-    inner: tikv_client::Transaction,
+    inner: Arc<Mutex<tikv_client::Transaction>>,
 }
+
+// Callback type definition for async operations
+type AsyncCallback = unsafe extern "C" fn(result: *const u8, result_len: usize, error: *const u8, error_len: usize, ctx: usize);
 
 fn raw_client_new(pd_endpoints: &CxxVector<CxxString>) -> Result<Box<RawKVClient>> {
     env_logger::builder()
@@ -198,8 +240,6 @@ fn transaction_client_new(pd_endpoints: &CxxVector<CxxString>) -> Result<Box<Tra
     }))
 }
 
-// begin_with_options(&self, options: TransactionOptions)
-
 fn transaction_client_begin(
     client: &TransactionClient,
     options: TxnOptions,
@@ -217,16 +257,16 @@ fn transaction_client_begin(
 
     Ok(Box::new(Transaction {
         rt: client.rt.handle().clone(),
-        inner: client
+        inner: Arc::new(Mutex::new(client
             .rt
-            .block_on(client.inner.begin_with_options(txn_options))?,
+            .block_on(client.inner.begin_with_options(txn_options))?)),
     }))
 }
 
 fn transaction_client_begin_pessimistic(client: &TransactionClient) -> Result<Box<Transaction>> {
     Ok(Box::new(Transaction {
         rt: client.rt.handle().clone(),
-        inner: client.rt.block_on(client.inner.begin_pessimistic())?,
+        inner: Arc::new(Mutex::new(client.rt.block_on(client.inner.begin_pessimistic())?)),
     }))
 }
 
@@ -330,13 +370,19 @@ fn raw_batch_put(cli: &RawKVClient, pairs: &CxxVector<KvPair>, timeout_ms: u64) 
 }
 
 fn transaction_timestamp(transaction: &Transaction) -> u64 {
-    transaction.inner.start_timestamp().version()
+    let inner = transaction.inner.blocking_lock();
+    inner.start_timestamp().version()
 }
 
 fn transaction_get(transaction: &mut Transaction, key: &CxxString) -> Result<OptionalValue> {
+    let key = key.as_bytes().to_vec();
+    let inner = transaction.inner.clone();
     match transaction
         .rt
-        .block_on(transaction.inner.get(key.as_bytes().to_vec()))?
+        .block_on(async move {
+            let mut txn = inner.lock().await;
+            txn.get(key).await
+        })?
     {
         Some(value) => Ok(OptionalValue {
             is_none: false,
@@ -353,9 +399,14 @@ fn transaction_get_for_update(
     transaction: &mut Transaction,
     key: &CxxString,
 ) -> Result<OptionalValue> {
+    let key = key.as_bytes().to_vec();
+    let inner = transaction.inner.clone();
     match transaction
         .rt
-        .block_on(transaction.inner.get_for_update(key.as_bytes().to_vec()))?
+        .block_on(async move {
+            let mut txn = inner.lock().await;
+            txn.get_for_update(key).await
+        })?
     {
         Some(value) => Ok(OptionalValue {
             is_none: false,
@@ -372,10 +423,14 @@ fn transaction_batch_get(
     transaction: &mut Transaction,
     keys: &CxxVector<CxxString>,
 ) -> Result<Vec<KvPair>> {
-    let keys = keys.iter().map(|key| key.as_bytes().to_vec());
+    let keys: Vec<Vec<u8>> = keys.iter().map(|key| key.as_bytes().to_vec()).collect();
+    let inner = transaction.inner.clone();
     let kv_pairs = transaction
         .rt
-        .block_on(transaction.inner.batch_get(keys))?
+        .block_on(async move {
+            let mut txn = inner.lock().await;
+            txn.batch_get(keys).await
+        })?
         .map(|tikv_client::KvPair(key, value)| KvPair {
             key: key.into(),
             value,
@@ -388,14 +443,6 @@ fn transaction_batch_get_for_update(
     _transaction: &mut Transaction,
     _keys: &CxxVector<CxxString>,
 ) -> Result<Vec<KvPair>> {
-    // let keys = keys.iter().map(|key| key.as_bytes().to_vec());
-    // let kv_pairs = block_on(transaction.inner.batch_get_for_update(keys))?
-    //     .map(|tikv_client::KvPair(key, value)| KvPair {
-    //         key: key.into(),
-    //         value,
-    //     })
-    //     .collect();
-    // Ok(kv_pairs)
     unimplemented!("batch_get_for_update is not working properly so far.")
 }
 
@@ -408,9 +455,13 @@ fn transaction_scan(
     limit: u32,
 ) -> Result<Vec<KvPair>> {
     let range = to_bound_range(start, start_bound, end, end_bound);
+    let inner = transaction.inner.clone();
     let kv_pairs = transaction
         .rt
-        .block_on(transaction.inner.scan(range, limit))?
+        .block_on(async move {
+            let mut txn = inner.lock().await;
+            txn.scan(range, limit).await
+        })?
         .map(|tikv_client::KvPair(key, value)| KvPair {
             key: key.into(),
             value,
@@ -428,38 +479,259 @@ fn transaction_scan_keys(
     limit: u32,
 ) -> Result<Vec<Key>> {
     let range = to_bound_range(start, start_bound, end, end_bound);
+    let inner = transaction.inner.clone();
     let keys = transaction
         .rt
-        .block_on(transaction.inner.scan_keys(range, limit))?
+        .block_on(async move {
+            let mut txn = inner.lock().await;
+            txn.scan_keys(range, limit).await
+        })?
         .map(|key| Key { key: key.into() })
         .collect();
     Ok(keys)
 }
 
 fn transaction_put(transaction: &mut Transaction, key: &CxxString, val: &CxxString) -> Result<()> {
-    transaction.rt.block_on(
-        transaction
-            .inner
-            .put(key.as_bytes().to_vec(), val.as_bytes().to_vec()),
-    )?;
+    let key = key.as_bytes().to_vec();
+    let val = val.as_bytes().to_vec();
+    let inner = transaction.inner.clone();
+    transaction.rt.block_on(async move {
+        let mut txn = inner.lock().await;
+        txn.put(key, val).await
+    })?;
     Ok(())
 }
 
 fn transaction_delete(transaction: &mut Transaction, key: &CxxString) -> Result<()> {
+    let key = key.as_bytes().to_vec();
+    let inner = transaction.inner.clone();
     transaction
         .rt
-        .block_on(transaction.inner.delete(key.as_bytes().to_vec()))?;
+        .block_on(async move {
+            let mut txn = inner.lock().await;
+            txn.delete(key).await
+        })?;
     Ok(())
 }
 
 fn transaction_commit(transaction: &mut Transaction) -> Result<()> {
-    transaction.rt.block_on(transaction.inner.commit())?;
+    let inner = transaction.inner.clone();
+    let _timestamp = transaction.rt.block_on(async move {
+        let mut txn = inner.lock().await;
+        txn.commit().await
+    })?;
     Ok(())
 }
 
 fn transaction_rollback(transaction: &mut Transaction) -> Result<()> {
-    transaction.rt.block_on(transaction.inner.rollback())?;
+    let inner = transaction.inner.clone();
+    transaction
+        .rt
+        .block_on(async move {
+            let mut txn = inner.lock().await;
+            txn.rollback().await
+        })?;
     Ok(())
+}
+
+// Helper function to invoke the callback from async context
+unsafe fn invoke_callback(
+    callback: usize,
+    result: Option<Vec<u8>>,
+    error: Option<String>,
+    ctx: usize,
+) {
+    let cb: AsyncCallback = std::mem::transmute(callback);
+
+    let (result_ptr, result_len) = match result {
+        Some(data) => {
+            let len = data.len();
+            let ptr = Box::into_raw(data.into_boxed_slice()) as *const u8;
+            (ptr, len)
+        }
+        None => (std::ptr::null(), 0),
+    };
+
+    let (error_ptr, error_len) = match &error {
+        Some(err) => {
+            let err_len = err.len();
+            let c_string = std::ffi::CString::new(err.clone())
+                .unwrap_or_else(|_| std::ffi::CString::new("Unknown error").unwrap());
+            let ptr = c_string.into_raw() as *const u8;
+            (ptr, err_len)
+        }
+        None => (std::ptr::null(), 0),
+    };
+
+    cb(result_ptr, result_len, error_ptr, error_len, ctx);
+}
+
+// Async implementations using usize for pointer representation
+
+fn transaction_get_async(
+    transaction: &Transaction,
+    key: &CxxString,
+    callback: usize,
+    ctx: usize,
+) {
+    let key = key.as_bytes().to_vec();
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.get(key).await
+        }.await;
+
+        match result {
+            Ok(value) => {
+                let opt_value = value.map(|v| OptionalValue {
+                    is_none: false,
+                    value: v,
+                }).unwrap_or_else(|| OptionalValue {
+                    is_none: true,
+                    value: Vec::new(),
+                });
+                // Serialize: is_none (1 byte) + value length (4 bytes) + value
+                let mut bytes = Vec::new();
+                bytes.push(if opt_value.is_none { 1 } else { 0 });
+                let value_len = opt_value.value.len() as u32;
+                bytes.extend_from_slice(&value_len.to_le_bytes());
+                bytes.extend_from_slice(&opt_value.value);
+                unsafe {
+                    invoke_callback(callback, Some(bytes), None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_put_async(
+    transaction: &Transaction,
+    key: &CxxString,
+    val: &CxxString,
+    callback: usize,
+    ctx: usize,
+) {
+    let key = key.as_bytes().to_vec();
+    let val = val.as_bytes().to_vec();
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.put(key, val).await
+        }.await;
+
+        match result {
+            Ok(()) => {
+                unsafe {
+                    invoke_callback(callback, None, None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_delete_async(
+    transaction: &Transaction,
+    key: &CxxString,
+    callback: usize,
+    ctx: usize,
+) {
+    let key = key.as_bytes().to_vec();
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.delete(key).await
+        }.await;
+
+        match result {
+            Ok(()) => {
+                unsafe {
+                    invoke_callback(callback, None, None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_commit_async(
+    transaction: &Transaction,
+    callback: usize,
+    ctx: usize,
+) {
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.commit().await
+        }.await;
+
+        match result {
+            Ok(_) => {
+                unsafe {
+                    invoke_callback(callback, None, None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_rollback_async(
+    transaction: &Transaction,
+    callback: usize,
+    ctx: usize,
+) {
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.rollback().await
+        }.await;
+
+        match result {
+            Ok(()) => {
+                unsafe {
+                    invoke_callback(callback, None, None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
 }
 
 fn to_bound_range(
