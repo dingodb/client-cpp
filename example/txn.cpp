@@ -158,6 +158,117 @@ void test_async_rollback(tikv_client::TransactionClient &client) {
   std::cout << "Rollback success" << std::endl;
 }
 
+// Example of async batch operations using future-based API
+void test_async_batch_future(tikv_client::TransactionClient &client) {
+  std::cout << "\n=== Test Async Batch Operations (Future API) ===" << std::endl;
+
+  auto txn = client.begin();
+
+  // Prepare batch data
+  std::vector<tikv_client::KvPair> kvs;
+  kvs.emplace_back(tikv_client::KvPair(std::string("batch_key1"), std::string("batch_value1")));
+  kvs.emplace_back(tikv_client::KvPair(std::string("batch_key2"), std::string("batch_value2")));
+  kvs.emplace_back(tikv_client::KvPair(std::string("batch_key3"), std::string("batch_value3")));
+
+  // Batch put asynchronously
+  auto batch_put_future = txn.batch_put_async_future(kvs);
+  batch_put_future.wait();
+  std::cout << "Batch put success" << std::endl;
+
+  // Batch get asynchronously
+  std::vector<std::string> keys = {"batch_key1", "batch_key2", "batch_key3", "non_existent_key"};
+  auto batch_get_future = txn.batch_get_async_future(keys);
+  auto results = batch_get_future.get();
+  std::cout << "Batch get returned " << results.size() << " results:" << std::endl;
+  for (const auto &kv : results) {
+    std::cout << "  " << kv.key << ": " << kv.value << std::endl;
+  }
+
+  // Commit asynchronously
+  auto commit_future = txn.commit_async_future();
+  commit_future.wait();
+  std::cout << "Commit success" << std::endl;
+}
+
+// Example of async scan operations using callback-based API
+void test_async_scan_callback(tikv_client::TransactionClient &client) {
+  std::cout << "\n=== Test Async Scan Operations (Callback API) ===" << std::endl;
+
+  auto txn = client.begin();
+
+  // First, put some data
+  txn.put("scan_key_a", "value_a");
+  txn.put("scan_key_b", "value_b");
+  txn.put("scan_key_c", "value_c");
+  txn.commit();
+
+  // New transaction for scan
+  auto txn2 = client.begin();
+
+  // Scan asynchronously with callback
+  txn2.scan_async("scan_key_a", Bound::Included, "scan_key_d", Bound::Excluded, 10,
+    [](const std::vector<tikv_client::KvPair> *pairs, const std::string *error, void *ctx) {
+      (void)ctx;
+      if (error) {
+        std::cerr << "Scan failed: " << *error << std::endl;
+      } else if (pairs) {
+        std::cout << "Scan returned " << pairs->size() << " results:" << std::endl;
+        for (const auto &kv : *pairs) {
+          std::cout << "  " << kv.key << ": " << kv.value << std::endl;
+        }
+      }
+    }, nullptr);
+
+  // Scan keys asynchronously with callback
+  txn2.scan_keys_async("scan_key_a", Bound::Included, "scan_key_d", Bound::Excluded, 10,
+    [](const std::vector<std::string> *keys, const std::string *error, void *ctx) {
+      (void)ctx;
+      if (error) {
+        std::cerr << "Scan keys failed: " << *error << std::endl;
+      } else if (keys) {
+        std::cout << "Scan keys returned " << keys->size() << " keys:" << std::endl;
+        for (const auto &key : *keys) {
+          std::cout << "  " << key << std::endl;
+        }
+      }
+    }, nullptr);
+
+  // Wait for async operations
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  // Commit
+  txn2.commit_async(
+    [](const std::string *error, void *ctx) {
+      (void)ctx;
+      if (error) {
+        std::cerr << "Commit failed: " << *error << std::endl;
+      } else {
+        std::cout << "Commit success" << std::endl;
+      }
+    }, nullptr);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
+
+// Example of async scan operations using future-based API
+void test_async_scan_future(tikv_client::TransactionClient &client) {
+  std::cout << "\n=== Test Async Scan Operations (Future API) ===" << std::endl;
+
+  auto txn = client.begin();
+
+  // Scan asynchronously using future
+  auto scan_future = txn.scan_async_future("", Bound::Included, "", Bound::Unbounded, 100);
+  auto results = scan_future.get();
+  std::cout << "Scan returned " << results.size() << " results" << std::endl;
+
+  // Scan keys asynchronously using future
+  auto scan_keys_future = txn.scan_keys_async_future("", Bound::Included, "", Bound::Unbounded, 100);
+  auto keys = scan_keys_future.get();
+  std::cout << "Scan keys returned " << keys.size() << " keys" << std::endl;
+
+  txn.rollback();
+}
+
 int main() {
   auto client = tikv_client::TransactionClient({"10.220.32.40:2379"});
   // test01(client);
