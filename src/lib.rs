@@ -182,6 +182,49 @@ mod ffi {
             callback: usize,
             ctx: usize,
         );
+
+        fn transaction_batch_get_async(
+            transaction: &Transaction,
+            keys: &CxxVector<CxxString>,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_batch_get_for_update_async(
+            transaction: &Transaction,
+            keys: &CxxVector<CxxString>,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_scan_async(
+            transaction: &Transaction,
+            start: &CxxString,
+            start_bound: Bound,
+            end: &CxxString,
+            end_bound: Bound,
+            limit: u32,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_scan_keys_async(
+            transaction: &Transaction,
+            start: &CxxString,
+            start_bound: Bound,
+            end: &CxxString,
+            end_bound: Bound,
+            limit: u32,
+            callback: usize,
+            ctx: usize,
+        );
+
+        fn transaction_batch_put_async(
+            transaction: &Transaction,
+            pairs: &CxxVector<KvPair>,
+            callback: usize,
+            ctx: usize,
+        );
     }
 }
 
@@ -717,6 +760,207 @@ fn transaction_rollback_async(
         let result = async {
             let mut txn = inner.lock().await;
             txn.rollback().await
+        }.await;
+
+        match result {
+            Ok(()) => {
+                unsafe {
+                    invoke_callback(callback, None, None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_batch_get_async(
+    transaction: &Transaction,
+    keys: &CxxVector<CxxString>,
+    callback: usize,
+    ctx: usize,
+) {
+    let keys: Vec<Vec<u8>> = keys.iter().map(|key| key.as_bytes().to_vec()).collect();
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.batch_get(keys).await
+        }.await;
+
+        match result {
+            Ok(kv_iter) => {
+                let kv_pairs: Vec<KvPair> = kv_iter
+                    .map(|tikv_client::KvPair(key, value)| KvPair {
+                        key: key.into(),
+                        value,
+                    })
+                    .collect();
+                // Serialize: count (4 bytes) + [key_len (4 bytes) + key + value_len (4 bytes) + value]...
+                let mut bytes = Vec::new();
+                let count = kv_pairs.len() as u32;
+                bytes.extend_from_slice(&count.to_le_bytes());
+                for pair in kv_pairs {
+                    let key_len = pair.key.len() as u32;
+                    let value_len = pair.value.len() as u32;
+                    bytes.extend_from_slice(&key_len.to_le_bytes());
+                    bytes.extend_from_slice(&pair.key);
+                    bytes.extend_from_slice(&value_len.to_le_bytes());
+                    bytes.extend_from_slice(&pair.value);
+                }
+                unsafe {
+                    invoke_callback(callback, Some(bytes), None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_batch_get_for_update_async(
+    _transaction: &Transaction,
+    _keys: &CxxVector<CxxString>,
+    callback: usize,
+    ctx: usize,
+) {
+    // For now, just return an error since the sync version is unimplemented
+    let handle = _transaction.rt.clone();
+    handle.spawn(async move {
+        unsafe {
+            invoke_callback(callback, None, Some("batch_get_for_update is not implemented yet".to_string()), ctx);
+        }
+    });
+}
+
+fn transaction_scan_async(
+    transaction: &Transaction,
+    start: &CxxString,
+    start_bound: Bound,
+    end: &CxxString,
+    end_bound: Bound,
+    limit: u32,
+    callback: usize,
+    ctx: usize,
+) {
+    let range = to_bound_range(start, start_bound, end, end_bound);
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.scan(range, limit).await
+        }.await;
+
+        match result {
+            Ok(kv_iter) => {
+                let kv_pairs: Vec<KvPair> = kv_iter
+                    .map(|tikv_client::KvPair(key, value)| KvPair {
+                        key: key.into(),
+                        value,
+                    })
+                    .collect();
+                // Serialize: count (4 bytes) + [key_len (4 bytes) + key + value_len (4 bytes) + value]...
+                let mut bytes = Vec::new();
+                let count = kv_pairs.len() as u32;
+                bytes.extend_from_slice(&count.to_le_bytes());
+                for pair in kv_pairs {
+                    let key_len = pair.key.len() as u32;
+                    let value_len = pair.value.len() as u32;
+                    bytes.extend_from_slice(&key_len.to_le_bytes());
+                    bytes.extend_from_slice(&pair.key);
+                    bytes.extend_from_slice(&value_len.to_le_bytes());
+                    bytes.extend_from_slice(&pair.value);
+                }
+                unsafe {
+                    invoke_callback(callback, Some(bytes), None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_scan_keys_async(
+    transaction: &Transaction,
+    start: &CxxString,
+    start_bound: Bound,
+    end: &CxxString,
+    end_bound: Bound,
+    limit: u32,
+    callback: usize,
+    ctx: usize,
+) {
+    let range = to_bound_range(start, start_bound, end, end_bound);
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            txn.scan_keys(range, limit).await
+        }.await;
+
+        match result {
+            Ok(key_iter) => {
+                let keys: Vec<Key> = key_iter
+                    .map(|key| Key { key: key.into() })
+                    .collect();
+                // Serialize: count (4 bytes) + [key_len (4 bytes) + key]...
+                let mut bytes = Vec::new();
+                let count = keys.len() as u32;
+                bytes.extend_from_slice(&count.to_le_bytes());
+                for key in keys {
+                    let key_len = key.key.len() as u32;
+                    bytes.extend_from_slice(&key_len.to_le_bytes());
+                    bytes.extend_from_slice(&key.key);
+                }
+                unsafe {
+                    invoke_callback(callback, Some(bytes), None, ctx);
+                }
+            }
+            Err(e) => {
+                unsafe {
+                    invoke_callback(callback, None, Some(format!("{}", e)), ctx);
+                }
+            }
+        }
+    });
+}
+
+fn transaction_batch_put_async(
+    transaction: &Transaction,
+    pairs: &CxxVector<KvPair>,
+    callback: usize,
+    ctx: usize,
+) {
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = pairs
+        .iter()
+        .map(|pair| (pair.key.to_vec(), pair.value.to_vec()))
+        .collect();
+    let handle = transaction.rt.clone();
+    let inner = transaction.inner.clone();
+
+    handle.spawn(async move {
+        let result = async {
+            let mut txn = inner.lock().await;
+            for (key, value) in pairs {
+                txn.put(key, value).await?;
+            }
+            Ok::<(), tikv_client::Error>(())
         }.await;
 
         match result {

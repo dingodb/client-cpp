@@ -23,7 +23,7 @@ struct KvPair final {
   std::string value;
 
   KvPair(std::string &&key, std::string &&value);
-  ffi::KvPair to_ffi();
+  ffi::KvPair to_ffi() const;
 };
 
 // Callback types for async operations
@@ -35,6 +35,20 @@ typedef void (*TransactionGetCallback)(
 
 typedef void (*TransactionVoidCallback)(
     const std::string *error,  // null on success
+    void *context
+);
+
+// Callback for batch_get and scan operations (vector of KvPair)
+typedef void (*TransactionKvPairsCallback)(
+    const std::vector<KvPair> *pairs,
+    const std::string *error,
+    void *context
+);
+
+// Callback for scan_keys operations (vector of keys)
+typedef void (*TransactionKeysCallback)(
+    const std::vector<std::string> *keys,
+    const std::string *error,
     void *context
 );
 
@@ -97,12 +111,63 @@ public:
       void *context
   );
 
+  // Async batch operations
+  void batch_get_async(
+      const std::vector<std::string> &keys,
+      TransactionKvPairsCallback callback,
+      void *context
+  );
+
+  void batch_get_for_update_async(
+      const std::vector<std::string> &keys,
+      TransactionKvPairsCallback callback,
+      void *context
+  );
+
+  void batch_put_async(
+      const std::vector<KvPair> &kvs,
+      TransactionVoidCallback callback,
+      void *context
+  );
+
+  // Async scan operations
+  void scan_async(
+      const std::string &start, Bound start_bound,
+      const std::string &end, Bound end_bound,
+      std::uint32_t limit,
+      TransactionKvPairsCallback callback,
+      void *context
+  );
+
+  void scan_keys_async(
+      const std::string &start, Bound start_bound,
+      const std::string &end, Bound end_bound,
+      std::uint32_t limit,
+      TransactionKeysCallback callback,
+      void *context
+  );
+
   // Future-based convenience wrappers
   std::future<std::optional<std::string>> get_async_future(const std::string &key);
   std::future<void> put_async_future(const std::string &key, const std::string &value);
   std::future<void> remove_async_future(const std::string &key);
   std::future<void> commit_async_future();
   std::future<void> rollback_async_future();
+
+  // Future-based wrappers for batch and scan operations
+  std::future<std::vector<KvPair>> batch_get_async_future(const std::vector<std::string> &keys);
+  std::future<std::vector<KvPair>> batch_get_for_update_async_future(const std::vector<std::string> &keys);
+  std::future<void> batch_put_async_future(const std::vector<KvPair> &kvs);
+
+  std::future<std::vector<KvPair>> scan_async_future(
+      const std::string &start, Bound start_bound,
+      const std::string &end, Bound end_bound,
+      std::uint32_t limit);
+
+  std::future<std::vector<std::string>> scan_keys_async_future(
+      const std::string &start, Bound start_bound,
+      const std::string &end, Bound end_bound,
+      std::uint32_t limit);
 
 private:
   ::rust::cxxbridge1::Box<tikv_client_glue::Transaction> _txn;

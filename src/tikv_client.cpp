@@ -17,7 +17,7 @@ namespace tikv_client {
 KvPair::KvPair(std::string &&key, std::string &&value)
     : key(std::move(key)), value(std::move(value)) {}
 
-ffi::KvPair KvPair::to_ffi() {
+ffi::KvPair KvPair::to_ffi() const {
   ffi::KvPair f_pair;
   f_pair.key.reserve(key.size());
   for (const auto &c : this->key) {
@@ -359,6 +359,206 @@ void Transaction::rollback_async(
       reinterpret_cast<uintptr_t>(ctx));
 }
 
+// Context structure for KvPairs async operations
+struct KvPairsAsyncContext {
+  TransactionKvPairsCallback callback;
+  void* user_context;
+
+  KvPairsAsyncContext(TransactionKvPairsCallback cb, void* ctx)
+      : callback(cb), user_context(ctx) {}
+};
+
+// Context structure for Keys async operations
+struct KeysAsyncContext {
+  TransactionKeysCallback callback;
+  void* user_context;
+
+  KeysAsyncContext(TransactionKeysCallback cb, void* ctx)
+      : callback(cb), user_context(ctx) {}
+};
+
+// Rust-compatible callback adapter for KvPairs operations
+extern "C" void kvpairs_async_rust_callback(
+    const uint8_t* result,
+    size_t result_len,
+    const uint8_t* error,
+    size_t error_len,
+    uintptr_t ctx) {
+  auto* context = reinterpret_cast<KvPairsAsyncContext*>(ctx);
+
+  if (error && error_len > 0) {
+    std::string error_msg(reinterpret_cast<const char*>(error), error_len);
+    if (context->callback) {
+      context->callback(nullptr, &error_msg, context->user_context);
+    }
+  } else if (result && result_len >= 4) {
+    // Parse serialized KvPairs: count (4 bytes) + [key_len (4 bytes) + key + value_len (4 bytes) + value]...
+    std::vector<KvPair> pairs;
+    uint32_t count = *reinterpret_cast<const uint32_t*>(result);
+    size_t offset = 4;
+
+    for (uint32_t i = 0; i < count && offset + 8 <= result_len; i++) {
+      uint32_t key_len = *reinterpret_cast<const uint32_t*>(result + offset);
+      offset += 4;
+      if (offset + key_len > result_len) break;
+      std::string key(reinterpret_cast<const char*>(result + offset), key_len);
+      offset += key_len;
+
+      if (offset + 4 > result_len) break;
+      uint32_t value_len = *reinterpret_cast<const uint32_t*>(result + offset);
+      offset += 4;
+      if (offset + value_len > result_len) break;
+      std::string value(reinterpret_cast<const char*>(result + offset), value_len);
+      offset += value_len;
+
+      pairs.emplace_back(std::move(key), std::move(value));
+    }
+
+    if (context->callback) {
+      context->callback(&pairs, nullptr, context->user_context);
+    }
+  } else {
+    std::vector<KvPair> empty_pairs;
+    if (context->callback) {
+      context->callback(&empty_pairs, nullptr, context->user_context);
+    }
+  }
+
+  delete context;
+
+  // Free the allocated memory from Rust side
+  if (result) {
+    delete[] result;
+  }
+  if (error) {
+    delete[] error;
+  }
+}
+
+// Rust-compatible callback adapter for Keys operations
+extern "C" void keys_async_rust_callback(
+    const uint8_t* result,
+    size_t result_len,
+    const uint8_t* error,
+    size_t error_len,
+    uintptr_t ctx) {
+  auto* context = reinterpret_cast<KeysAsyncContext*>(ctx);
+
+  if (error && error_len > 0) {
+    std::string error_msg(reinterpret_cast<const char*>(error), error_len);
+    if (context->callback) {
+      context->callback(nullptr, &error_msg, context->user_context);
+    }
+  } else if (result && result_len >= 4) {
+    // Parse serialized Keys: count (4 bytes) + [key_len (4 bytes) + key]...
+    std::vector<std::string> keys;
+    uint32_t count = *reinterpret_cast<const uint32_t*>(result);
+    size_t offset = 4;
+
+    for (uint32_t i = 0; i < count && offset + 4 <= result_len; i++) {
+      uint32_t key_len = *reinterpret_cast<const uint32_t*>(result + offset);
+      offset += 4;
+      if (offset + key_len > result_len) break;
+      std::string key(reinterpret_cast<const char*>(result + offset), key_len);
+      offset += key_len;
+      keys.emplace_back(std::move(key));
+    }
+
+    if (context->callback) {
+      context->callback(&keys, nullptr, context->user_context);
+    }
+  } else {
+    std::vector<std::string> empty_keys;
+    if (context->callback) {
+      context->callback(&empty_keys, nullptr, context->user_context);
+    }
+  }
+
+  delete context;
+
+  // Free the allocated memory from Rust side
+  if (result) {
+    delete[] result;
+  }
+  if (error) {
+    delete[] error;
+  }
+}
+
+// Async batch operations implementations
+void Transaction::batch_get_async(
+    const std::vector<std::string> &keys,
+    TransactionKvPairsCallback callback,
+    void *context) {
+  auto* ctx = new KvPairsAsyncContext(callback, context);
+  tikv_client_glue::transaction_batch_get_async(
+      *_txn,
+      keys,
+      reinterpret_cast<uintptr_t>(kvpairs_async_rust_callback),
+      reinterpret_cast<uintptr_t>(ctx));
+}
+
+void Transaction::batch_get_for_update_async(
+    const std::vector<std::string> &keys,
+    TransactionKvPairsCallback callback,
+    void *context) {
+  auto* ctx = new KvPairsAsyncContext(callback, context);
+  tikv_client_glue::transaction_batch_get_for_update_async(
+      *_txn,
+      keys,
+      reinterpret_cast<uintptr_t>(kvpairs_async_rust_callback),
+      reinterpret_cast<uintptr_t>(ctx));
+}
+
+void Transaction::batch_put_async(
+    const std::vector<KvPair> &kvs,
+    TransactionVoidCallback callback,
+    void *context) {
+  auto* ctx = new VoidAsyncContext(callback, context);
+  std::vector<ffi::KvPair> pairs;
+  pairs.reserve(kvs.size());
+  for (const auto &kv : kvs) {
+    pairs.emplace_back(kv.to_ffi());
+  }
+  tikv_client_glue::transaction_batch_put_async(
+      *_txn,
+      pairs,
+      reinterpret_cast<uintptr_t>(void_async_rust_callback),
+      reinterpret_cast<uintptr_t>(ctx));
+}
+
+void Transaction::scan_async(
+    const std::string &start, Bound start_bound,
+    const std::string &end, Bound end_bound,
+    std::uint32_t limit,
+    TransactionKvPairsCallback callback,
+    void *context) {
+  auto* ctx = new KvPairsAsyncContext(callback, context);
+  tikv_client_glue::transaction_scan_async(
+      *_txn,
+      start, start_bound,
+      end, end_bound,
+      limit,
+      reinterpret_cast<uintptr_t>(kvpairs_async_rust_callback),
+      reinterpret_cast<uintptr_t>(ctx));
+}
+
+void Transaction::scan_keys_async(
+    const std::string &start, Bound start_bound,
+    const std::string &end, Bound end_bound,
+    std::uint32_t limit,
+    TransactionKeysCallback callback,
+    void *context) {
+  auto* ctx = new KeysAsyncContext(callback, context);
+  tikv_client_glue::transaction_scan_keys_async(
+      *_txn,
+      start, start_bound,
+      end, end_bound,
+      limit,
+      reinterpret_cast<uintptr_t>(keys_async_rust_callback),
+      reinterpret_cast<uintptr_t>(ctx));
+}
+
 // Future-based implementations
 namespace {
   // Helper to generate unique IDs for promises
@@ -464,6 +664,99 @@ std::future<void> Transaction::rollback_async_future() {
   uint64_t id = g_void_promises.add(promise);
 
   rollback_async(void_promise_callback, reinterpret_cast<void*>(id));
+
+  return future;
+}
+
+// Promise maps for new async types
+PromiseMap<std::vector<KvPair>> g_kvpairs_promises;
+PromiseMap<std::vector<std::string>> g_keys_promises;
+
+// Promise callbacks for new async types
+extern "C" void kvpairs_promise_callback(const std::vector<KvPair> *pairs, const std::string *error, void *ctx) {
+  uint64_t id = reinterpret_cast<uintptr_t>(ctx);
+  auto promise = g_kvpairs_promises.remove(id);
+  if (promise) {
+    if (error) {
+      promise->set_exception(std::make_exception_ptr(std::runtime_error(*error)));
+    } else if (pairs) {
+      promise->set_value(*pairs);
+    } else {
+      promise->set_value(std::vector<KvPair>());
+    }
+  }
+}
+
+extern "C" void keys_promise_callback(const std::vector<std::string> *keys, const std::string *error, void *ctx) {
+  uint64_t id = reinterpret_cast<uintptr_t>(ctx);
+  auto promise = g_keys_promises.remove(id);
+  if (promise) {
+    if (error) {
+      promise->set_exception(std::make_exception_ptr(std::runtime_error(*error)));
+    } else if (keys) {
+      promise->set_value(*keys);
+    } else {
+      promise->set_value(std::vector<std::string>());
+    }
+  }
+}
+
+// Future-based implementations for batch operations
+std::future<std::vector<KvPair>> Transaction::batch_get_async_future(const std::vector<std::string> &keys) {
+  auto promise = std::make_shared<std::promise<std::vector<KvPair>>>();
+  auto future = promise->get_future();
+  uint64_t id = g_kvpairs_promises.add(promise);
+
+  batch_get_async(keys, kvpairs_promise_callback, reinterpret_cast<void*>(id));
+
+  return future;
+}
+
+std::future<std::vector<KvPair>> Transaction::batch_get_for_update_async_future(const std::vector<std::string> &keys) {
+  auto promise = std::make_shared<std::promise<std::vector<KvPair>>>();
+  auto future = promise->get_future();
+  uint64_t id = g_kvpairs_promises.add(promise);
+
+  batch_get_for_update_async(keys, kvpairs_promise_callback, reinterpret_cast<void*>(id));
+
+  return future;
+}
+
+std::future<void> Transaction::batch_put_async_future(const std::vector<KvPair> &kvs) {
+  auto promise = std::make_shared<std::promise<void>>();
+  auto future = promise->get_future();
+  uint64_t id = g_void_promises.add(promise);
+
+  batch_put_async(kvs, void_promise_callback, reinterpret_cast<void*>(id));
+
+  return future;
+}
+
+// Future-based implementations for scan operations
+std::future<std::vector<KvPair>> Transaction::scan_async_future(
+    const std::string &start, Bound start_bound,
+    const std::string &end, Bound end_bound,
+    std::uint32_t limit) {
+  auto promise = std::make_shared<std::promise<std::vector<KvPair>>>();
+  auto future = promise->get_future();
+  uint64_t id = g_kvpairs_promises.add(promise);
+
+  scan_async(start, start_bound, end, end_bound, limit,
+             kvpairs_promise_callback, reinterpret_cast<void*>(id));
+
+  return future;
+}
+
+std::future<std::vector<std::string>> Transaction::scan_keys_async_future(
+    const std::string &start, Bound start_bound,
+    const std::string &end, Bound end_bound,
+    std::uint32_t limit) {
+  auto promise = std::make_shared<std::promise<std::vector<std::string>>>();
+  auto future = promise->get_future();
+  uint64_t id = g_keys_promises.add(promise);
+
+  scan_keys_async(start, start_bound, end, end_bound, limit,
+                  keys_promise_callback, reinterpret_cast<void*>(id));
 
   return future;
 }
